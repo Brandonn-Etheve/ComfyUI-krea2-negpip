@@ -965,6 +965,7 @@ def _krea2_negpip_calc_cond_batch_wrapper(executor, model, conds, x_in, timestep
 def _negative_metadata_from_transformer_options(
     transformer_options: Any,
     context_len: int,
+    batch_size: int | None = None,
 ) -> tuple[list[list[int]], int | None] | None:
     if not isinstance(transformer_options, dict):
         return None
@@ -1013,6 +1014,12 @@ def _negative_metadata_from_transformer_options(
         rows.append(row)
         found = found or bool(row)
 
+    if batch_size is not None:
+        # The sampler concatenates one image batch per UUID, in contiguous chunks.
+        # Match the per-image rows returned by the sidecar parser, not modulo order.
+        if batch_size < len(rows) or batch_size % len(rows):
+            return None
+        rows = [row for row in rows for _ in range(batch_size // len(rows))]
     return (rows, trim_to_length) if found else None
 
 
@@ -1139,7 +1146,7 @@ def _v_row_magnitudes(v: torch.Tensor, keep: list[int], span_end: int) -> str:
         other_text = f32[:, :, text_mask, :].abs().mean().item() if bool(text_mask.any()) else float("nan")
         image = f32[:, :, span_end:, :].abs().mean().item() if span_end < f32.shape[2] else float("nan")
     return (f"mean|v| flipped={flipped:.4g} other_text={other_text:.4g} image={image:.4g} "
-            f"(flipped/other_text={flipped / other_text:.3g})" if other_text == other_text
+            f"(flipped/other_text={flipped / other_text:.3g})" if other_text > 0
             else f"mean|v| flipped={flipped:.4g}")
 
 
@@ -1160,17 +1167,22 @@ def _resolve_negative_weights(transformer_options: Any, positions: list[list[int
     if not isinstance(metadata, dict) or not isinstance(uuids, list) or not uuids:
         return None
 
+    # UUIDs identify conditioning chunks, not individual image rows. All chunks
+    # have the same image batch size (comfy.samplers.can_concat_cond).
+    if not positions or len(positions) % len(uuids):
+        return None
+    rows_per_uuid = len(positions) // len(uuids)
+
     rows: list[list[float]] = []
     saw_weight = False
     for index, row in enumerate(positions):
         weights = None
-        if index < len(uuids):
-            item = metadata.get(str(uuids[index]))
-            if isinstance(item, dict):
-                candidate = item.get("weights")
-                if isinstance(candidate, list) and len(candidate) == len(row):
-                    weights = [abs(float(w)) for w in candidate]
-                    saw_weight = True
+        item = metadata.get(str(uuids[index // rows_per_uuid]))
+        if isinstance(item, dict):
+            candidate = item.get("weights")
+            if isinstance(candidate, list) and len(candidate) == len(row):
+                weights = [abs(float(w)) for w in candidate]
+                saw_weight = True
         rows.append(weights if weights is not None else [1.0] * len(row))
     return rows if saw_weight else None
 
@@ -1414,7 +1426,8 @@ def krea2_negpip_wrapper(executor, x, timesteps, context, attention_mask=None, r
     context, negative_positions, keep_indices = _parse_and_strip_sidecar_full(context)
     attention_mask = _strip_mask_with_indices(attention_mask, keep_indices, original_context_len)
     if negative_positions is None:
-        metadata_fallback = _negative_metadata_from_transformer_options(transformer_options, context.shape[1])
+        metadata_fallback = _negative_metadata_from_transformer_options(
+            transformer_options, context.shape[1], context.shape[0])
         if metadata_fallback is None:
             return executor(x, timesteps, context, attention_mask, ref_latents, transformer_options, **kwargs)
         negative_positions, trim_to_length = metadata_fallback
@@ -1579,12 +1592,12 @@ class ApplyKrea2NegPiP:
                 "clip": ("CLIP",),
                 "value_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 8.0, "step": 0.05}),
                 "patch_txtfusion_refiners": ("BOOLEAN", {"default": False}),
-                "debug": (DEBUG_MODES, {"default": DEBUG_OFF}),
             },
             "optional": {
                 "block_start": ("INT", {"default": 0, "min": 0, "max": 999, "step": 1}),
                 "block_end": ("INT", {"default": 27, "min": 0, "max": 999, "step": 1}),
                 "block_stride": ("INT", {"default": 1, "min": 1, "max": 16, "step": 1}),
+                "debug": (DEBUG_MODES, {"default": DEBUG_OFF}),
             },
         }
 
@@ -1594,7 +1607,7 @@ class ApplyKrea2NegPiP:
     CATEGORY = "loaders"
 
     def apply(self, model, clip, value_strength=1.0, patch_txtfusion_refiners=False,
-              debug=DEBUG_OFF, block_start=0, block_end=27, block_stride=1):
+              block_start=0, block_end=27, block_stride=1, debug=DEBUG_OFF):
         new_clip = _patch_clip_for_krea2_negpip(clip)
         patched = model.clone()
 
