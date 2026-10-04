@@ -10,6 +10,6 @@ dependencies = []
 Repository = "https://github.com/Brandonn-Etheve/ComfyUI-krea2-negpip"
 
 [tool.comfy]
-PublisherId = "Brandonn-Etheve"
+PublisherId = "brandonn-etheve"
 DisplayName = "ComfyUI Krea 2 NegPiP"
 Icon = ""
